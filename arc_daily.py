@@ -267,7 +267,10 @@ def save_state(state: dict):
 
 def get_account_state(state: dict, email: str) -> dict:
     if email not in state:
-        state[email] = {"registered_events": [], "last_run": None}
+        state[email] = {"registered_events": [], "read_articles": [], "last_run": None}
+    # 兼容旧版没有 read_articles 字段的情况
+    if "read_articles" not in state[email]:
+        state[email]["read_articles"] = []
     return state[email]
 
 
@@ -543,7 +546,7 @@ async def login(page: Page, account: Account) -> bool:
 
 
 # ─── 任务 1 & 2：阅读文章 + 观看视频 ─────────────────────────────────────────
-async def read_content(page: Page, email: str) -> dict:
+async def read_content(page: Page, email: str, acct_state: dict) -> dict:
     log.info(f"[{email}] === 任务1&2：Content 阅读文章 + 视频 ===")
     await page.goto(f"{BASE_URL}/home/content", wait_until="domcontentloaded")
     await human_delay(3, 5)
@@ -552,6 +555,9 @@ async def read_content(page: Page, email: str) -> dict:
     videos_watched = 0
     TARGET_ARTICLES = 5
     TARGET_VIDEOS   = 1
+
+    # 已读记录（按邮箱隔离，持久化在 arc_state.json）
+    read_history: list = acct_state.get("read_articles", [])
 
     # 直接获取内容链接，不等待 visible（导航栏也有 /home/ 链接会导致 wait_for_selector 超时）
     links = await page.locator(
@@ -577,9 +583,24 @@ async def read_content(page: Page, email: str) -> dict:
             hrefs.append(href)
 
     log.info(f"[{email}] 发现 {len(hrefs)} 个内容链接")
-    random.shuffle(hrefs)
 
-    for href in hrefs:
+    # 过滤掉已读过的文章（视频不做去重，数量少）
+    new_hrefs  = [h for h in hrefs if h not in read_history or "/videos/" in h]
+    skip_count = len(hrefs) - len(new_hrefs)
+    if skip_count > 0:
+        log.info(f"[{email}] 跳过已读文章 {skip_count} 篇，剩余新内容 {len(new_hrefs)} 篇")
+
+    # 如果新内容不够 5 篇，把已读的也补进来（保证任务能完成）
+    if len(new_hrefs) < TARGET_ARTICLES:
+        already_read = [h for h in hrefs if h in read_history and "/videos/" not in h]
+        needed = TARGET_ARTICLES - len(new_hrefs)
+        new_hrefs += already_read[:needed]
+        if already_read:
+            log.info(f"[{email}] 新内容不足，补充 {min(needed, len(already_read))} 篇旧文章凑够任务数")
+
+    random.shuffle(new_hrefs)
+
+    for href in new_hrefs:
         if articles_read >= TARGET_ARTICLES and videos_watched >= TARGET_VIDEOS:
             break
 
@@ -602,13 +623,17 @@ async def read_content(page: Page, email: str) -> dict:
                 videos_watched += 1
             else:
                 articles_read += 1
+                # 记录已读（用规范化的 href 存储，避免 http/https 差异）
+                if href not in read_history:
+                    read_history.append(href)
+                    acct_state["read_articles"] = read_history
 
             await page.go_back()
             await human_delay(2, 4)
         except Exception as e:
             log.warning(f"[{email}]   跳过: {e}")
 
-    log.info(f"[{email}] Content 完成：文章 {articles_read}/{TARGET_ARTICLES}，视频 {videos_watched}/{TARGET_VIDEOS}")
+    log.info(f"[{email}] Content 完成：文章 {articles_read}/{TARGET_ARTICLES}，视频 {videos_watched}/{TARGET_VIDEOS}，累计已读 {len(read_history)} 篇")
     return {"articles": articles_read, "videos": videos_watched}
 
 
@@ -982,7 +1007,7 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
         result.score_before = await get_score(page, account.email)
 
         # 执行任务
-        content_result   = await read_content(page, account.email)
+        content_result   = await read_content(page, account.email, acct_state)
         await human_delay(3, 6)
 
         events_count     = await register_events(page, account.email, acct_state)
