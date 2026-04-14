@@ -49,6 +49,8 @@ import re
 import json
 import logging
 import time
+import subprocess
+import socket
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -186,20 +188,8 @@ def load_gmail_passes(count: int) -> list[str]:
 def load_proxies(count: int) -> list[str | None]:
     """读取 proxies.txt，返回与账号等长的代理列表。缺少行时报错退出。"""
     if not PROXIES_FILE.exists():
-        PROXIES_FILE.write_text(
-            "# 代理配置文件，每行一个代理，与 accounts.txt 按行一一对应\n"
-            "# 支持格式：\n"
-            "#   http://user:pass@host:port\n"
-            "#   socks5://user:pass@host:port\n"
-            "#   http://host:port  （无认证）\n"
-            "#   none              （该账号不使用代理，不推荐）\n"
-            "# 示例：\n"
-            "# http://user1:pass1@1.2.3.4:8080\n"
-            "# socks5://user2:pass2@5.6.7.8:1080\n",
-            encoding="utf-8",
-        )
-        log.error(f"代理文件不存在，已创建示例：{PROXIES_FILE}\n请填写代理后重新运行。")
-        sys.exit(1)
+        log.warning(f"代理文件不存在，所有账号将直连。如需代理请创建 {PROXIES_FILE}")
+        return [None] * count
 
     lines = []
     for line in PROXIES_FILE.read_text(encoding="utf-8").splitlines():
@@ -209,11 +199,9 @@ def load_proxies(count: int) -> list[str | None]:
         lines.append(None if line.lower() == "none" else line)
 
     if len(lines) < count:
-        log.error(
-            f"proxies.txt 只有 {len(lines)} 条代理，但有 {count} 个账号。"
-            f"请补全代理（每个账号必须有独立代理）。"
-        )
-        sys.exit(1)
+        gap = count - len(lines)
+        log.warning(f"proxies.txt 只有 {len(lines)} 条代理，账号有 {count} 个，剩余 {gap} 个账号将直连。")
+        lines += [None] * gap
 
     if len(lines) > count:
         log.warning(f"proxies.txt 有 {len(lines)} 条，账号有 {count} 个，多余代理已忽略。")
@@ -231,16 +219,58 @@ def load_proxies(count: int) -> list[str | None]:
     return lines[:count]
 
 
+# ─── socks5 带认证代理转发（gost）────────────────────────────────────────────
+_gost_procs: dict[str, tuple] = {}  # proxy_url -> (local_port, proc)
+
+def _free_port() -> int:
+    """找一个可用的本地端口"""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+def start_gost_tunnel(proxy_url: str) -> str:
+    """
+    对 socks5://user:pass@host:port 代理，用 gost 在本地起一个无认证 http 代理。
+    返回本地 http 代理 URL，如 http://127.0.0.1:XXXXX
+    已启动过的代理直接复用（缓存）。
+    """
+    if proxy_url in _gost_procs:
+        port, proc = _gost_procs[proxy_url]
+        if proc.poll() is None:  # 进程还活着
+            return f"http://127.0.0.1:{port}"
+        else:
+            del _gost_procs[proxy_url]
+
+    port = _free_port()
+    cmd = [
+        "gost",
+        "-L", f"http://127.0.0.1:{port}",
+        "-F", proxy_url,
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.8)  # 等 gost 启动
+    _gost_procs[proxy_url] = (port, proc)
+    log.info(f"  [gost] socks5 转发 -> http://127.0.0.1:{port}")
+    return f"http://127.0.0.1:{port}"
+
+def stop_all_gost():
+    """脚本结束时关闭所有 gost 进程"""
+    for url, (port, proc) in _gost_procs.items():
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    _gost_procs.clear()
+
+
 def parse_proxy(proxy_url: str) -> dict:
     """
     将代理 URL 解析为 Playwright context 所需的 proxy dict。
     Playwright 格式：{"server": "...", "username": "...", "password": "***"}
 
-    注意：Playwright Chromium 不支持 socks5 带认证（Browser limitation）。
-    对于 socks5://user:pass@host:port，去掉认证直接连（无认证 socks5），
-    或者代理不可用时跳过。
+    注意：Playwright Chromium 不支持 socks5 带认证。
+    对于 socks5://user:pass@host:port，自动用 gost 转成本地无认证 http 代理。
     """
-    # 提取认证信息
     m = re.match(
         r'^((?:http|https|socks5)://)(?:([^:@]+):([^@]+)@)?(.+)$',
         proxy_url,
@@ -250,10 +280,10 @@ def parse_proxy(proxy_url: str) -> dict:
 
     scheme, username, password, hostport = m.groups()
 
-    # socks5 带认证：Chromium 不支持，去掉认证部分（只保留 host:port）
+    # socks5 带认证：Chromium 不支持，用 gost 本地转发
     if scheme == "socks5://" and username:
-        # 改用无认证的 socks5
-        return {"server": f"socks5://{hostport}"}
+        local_http = start_gost_tunnel(proxy_url)
+        return {"server": local_http}
 
     result: dict = {"server": f"{scheme}{hostport}"}
     if username:
@@ -1254,4 +1284,7 @@ if __name__ == "__main__":
     if "--setup" in sys.argv:
         setup()
     else:
-        asyncio.run(main())
+        try:
+            asyncio.run(main())
+        finally:
+            stop_all_gost()
