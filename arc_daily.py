@@ -234,7 +234,11 @@ def load_proxies(count: int) -> list[str | None]:
 def parse_proxy(proxy_url: str) -> dict:
     """
     将代理 URL 解析为 Playwright context 所需的 proxy dict。
-    Playwright 格式：{"server": "...", "username": "...", "password": "..."}
+    Playwright 格式：{"server": "...", "username": "...", "password": "***"}
+
+    注意：Playwright Chromium 不支持 socks5 带认证（Browser limitation）。
+    对于 socks5://user:pass@host:port，去掉认证直接连（无认证 socks5），
+    或者代理不可用时跳过。
     """
     # 提取认证信息
     m = re.match(
@@ -245,6 +249,12 @@ def parse_proxy(proxy_url: str) -> dict:
         return {"server": proxy_url}
 
     scheme, username, password, hostport = m.groups()
+
+    # socks5 带认证：Chromium 不支持，去掉认证部分（只保留 host:port）
+    if scheme == "socks5://" and username:
+        # 改用无认证的 socks5
+        return {"server": f"socks5://{hostport}"}
+
     result: dict = {"server": f"{scheme}{hostport}"}
     if username:
         result["username"] = username
@@ -669,7 +679,10 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
                 continue
 
             log.info(f"[{email}]   注册: {title}")
-            await btn.scroll_into_view_if_needed()
+            try:
+                await btn.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
             await human_delay(1, 2)
             await btn.click()
             await human_delay(2, 4)
@@ -742,9 +755,12 @@ async def create_post(page: Page, email: str) -> bool:
         create_btn = page.locator(
             "button:has-text('Create a post'), button:has-text('New post'), a:has-text('Create a post')"
         ).first
-        await create_btn.scroll_into_view_if_needed()
+        try:
+            await create_btn.scroll_into_view_if_needed(timeout=5000)
+        except Exception:
+            pass
         await human_delay(1, 2)
-        await create_btn.click()
+        await create_btn.click(timeout=8000)
         await human_delay(2, 3)
 
         # 标题
